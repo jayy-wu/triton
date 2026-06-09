@@ -1,16 +1,21 @@
 #include "triton/Analysis/Allocation.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 
 #include "mlir/Analysis/Liveness.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/Alias.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -223,6 +228,12 @@ public:
                      AllocationAnalysisScratchSizeFn scratchSizeGetter)
       : operation(operation), funcAllocMap(funcAllocMap),
         allocation(allocation), scratchSizeGetter(scratchSizeGetter) {
+    const char *env = std::getenv("SALA_ENABLE");
+    salaEnabled = env && std::string(env) == "1";
+    const char *dumpEnv = std::getenv("SALA_DUMP_IGRAPH");
+    salaDumpIGraph = dumpEnv && std::string(dumpEnv) == "1";
+    const char *noBarEnv = std::getenv("SALA_NO_BARRIER");
+    salaNoBarrier = noBarEnv && std::string(noBarEnv) == "1";
     run();
   }
 
@@ -234,6 +245,13 @@ private:
   using BufferRangeMapT = llvm::MapVector<BufferT *, Interval<size_t>>;
   /// Nodes -> Nodes
   using GraphT = DenseMap<BufferT *, DenseSet<BufferT *>>;
+  /// SALA: skipped interference edges for diagnostics
+  using EdgeSetT = DenseSet<std::pair<BufferT *, BufferT *>>;
+
+  bool salaEnabled = false;
+  bool salaDumpIGraph = false;
+  bool salaNoBarrier = false;
+  EdgeSetT salaSkippedEdges;
 
   void run() {
     getValuesAndSizes();
@@ -543,6 +561,23 @@ private:
       buildInterferenceGraph(buffers, interference);
     } while (!interference.empty());
 
+    // SALA post-pass: compact non-aref buffers to overlap with aref region
+    if (salaEnabled) {
+      // Check if there are aref buffers and non-aref WG buffers
+      bool hasAref = false, hasNonArefWG = false;
+      for (auto *buf : buffers) {
+        if (buf->owner->hasAttr("aref_buffer"))
+          hasAref = true;
+        else if (!buf->owner->hasAttr("aref_empty_mbarriers") &&
+                 !buf->owner->hasAttr("aref_full_mbarriers") &&
+                 buf->owner->getParentOfType<nvidia_gpu::WarpGroupOp>())
+          hasNonArefWG = true;
+      }
+      if (hasAref && hasNonArefWG) {
+        salaCompact(buffers, interference);
+      }
+    }
+
     LLVM_DEBUG(dumpAllocationSize());
   }
 
@@ -650,6 +685,20 @@ private:
         auto wgx = x->owner->getParentOfType<nvidia_gpu::WarpGroupOp>();
         auto wgy = y->owner->getParentOfType<nvidia_gpu::WarpGroupOp>();
         if ((wgx || wgy) && wgx != wgy && xSizeRange.intersects(ySizeRange)) {
+          // SALA: skip interference between aref pipeline buffers and
+          // non-aref output buffers in different warp groups.
+          bool xIsAref = x->owner->hasAttr("aref_buffer") ||
+                         x->owner->hasAttr("aref_empty_mbarriers") ||
+                         x->owner->hasAttr("aref_full_mbarriers");
+          bool yIsAref = y->owner->hasAttr("aref_buffer") ||
+                         y->owner->hasAttr("aref_empty_mbarriers") ||
+                         y->owner->hasAttr("aref_full_mbarriers");
+          // Skip when one is aref (possibly top-level) and the other
+          // is a non-aref buffer inside a WarpGroupOp
+          if (salaEnabled && xIsAref != yIsAref && wgx != wgy) {
+            salaSkippedEdges.insert({x, y});
+            continue;
+          }
           interference[x].insert(y);
         }
       }
@@ -704,6 +753,169 @@ private:
           std::max(allocation->sharedMemorySize, x->offset + x->size);
     }
     LLVM_DEBUG(dumpBuffers());
+  }
+
+  /// SALA: compact non-aref buffers to offset 0 (overlapping with aref
+  /// pipeline region) and re-place barrier buffers tightly.
+  void salaCompact(const SmallVector<BufferT *> &buffers,
+                   const GraphT &interference) {
+    size_t origSize = allocation->sharedMemorySize;
+
+    // Capture baseline offsets for diagnostic
+    DenseMap<BufferT *, size_t> baselineOffsets;
+    for (auto *buf : buffers)
+      baselineOffsets[buf] = buf->offset;
+
+    bool compacted = false;
+    for (auto *buf : buffers) {
+      if (buf->owner->hasAttr("aref_buffer") ||
+          buf->owner->hasAttr("aref_empty_mbarriers") ||
+          buf->owner->hasAttr("aref_full_mbarriers"))
+        continue;
+      if (!buf->owner->getParentOfType<nvidia_gpu::WarpGroupOp>())
+        continue;
+      // SALA: the happens-before relationship from the aref protocol
+      // guarantees that pipeline buffers and the output buffer are
+      // never live simultaneously within a single tile iteration.
+      buf->setOffsetAligned(0);
+      compacted = true;
+    }
+    if (!compacted)
+      return;
+
+    // Re-pack aref pipeline buffers tightly (close gaps left by moved
+    // non-aref buffers that previously sat between pipeline stages).
+    SmallVector<BufferT *> arefBufs;
+    for (auto *buf : buffers)
+      if (buf->owner->hasAttr("aref_buffer"))
+        arefBufs.push_back(buf);
+    llvm::sort(arefBufs,
+               [](BufferT *a, BufferT *b) { return a->offset < b->offset; });
+    size_t pipelineCursor = 0;
+    for (auto *buf : arefBufs) {
+      buf->setOffsetAligned(pipelineCursor);
+      pipelineCursor = buf->offset + buf->size;
+    }
+
+    // Re-place barrier buffers right after the aref pipeline buffers
+    size_t pipelineEnd = pipelineCursor;
+    for (auto *buf : buffers) {
+      if (buf->owner->hasAttr("aref_empty_mbarriers") ||
+          buf->owner->hasAttr("aref_full_mbarriers")) {
+        buf->setOffsetAligned(pipelineEnd);
+        pipelineEnd = buf->offset + buf->size;
+      }
+    }
+
+    // Recompute total
+    allocation->sharedMemorySize = 0;
+    for (auto *buf : buffers) {
+      allocation->sharedMemorySize =
+          std::max(allocation->sharedMemorySize, buf->offset + buf->size);
+    }
+
+    // Insert cross-tile barrier for persistent kernels (unless disabled)
+    if (!salaNoBarrier)
+      salaInsertCrossTileBarrier();
+
+    // Dump IGraph diagnostics
+    if (salaDumpIGraph)
+      salaDumpIGraphDiagnostic(buffers, interference, origSize,
+                               baselineOffsets);
+
+    llvm::errs() << "[SALA] Compaction: " << origSize << " -> "
+                 << allocation->sharedMemorySize << " bytes ("
+                 << origSize / 1024 << " KB -> "
+                 << allocation->sharedMemorySize / 1024 << " KB, "
+                 << (100 - 100 * allocation->sharedMemorySize / origSize)
+                 << "% reduction)\n";
+  }
+
+  /// SALA: insert cross-tile synchronization for persistent kernels.
+  /// Only the TMA load group gets bar.sync; the MMA group proceeds freely.
+  /// Correctness relies on the aref protocol's within-tile barriers: the TMA
+  /// load group cannot start loading tile N+1 until the MMA group's epilogue
+  /// store for tile N is visible. bar.sync in the TMA group's outer loop
+  /// ensures this -- the MMA group doesn't need to participate because its
+  /// arrive_barrier(empty) after WGMMA already guarantees the store is issued
+  /// before the next tile's loads can begin.
+  void salaInsertCrossTileBarrier() {
+    operation->walk([&](scf::ForOp forOp) {
+      auto *parentOp = forOp->getParentOp();
+      if (!isa<nvidia_gpu::WarpGroupOp>(parentOp))
+        return;
+
+      // Only persistent kernels: must have nested for-loop (K-loop)
+      bool hasNestedFor = false;
+      forOp.walk([&](scf::ForOp innerFor) {
+        if (innerFor != forOp)
+          hasNestedFor = true;
+      });
+      if (!hasNestedFor)
+        return;
+
+      auto loc = forOp.getLoc();
+      OpBuilder builder(forOp.getContext());
+      auto i32Ty = builder.getIntegerType(32);
+
+      // Insert CTA-wide barrier before scf.yield of the outer tile loop
+      auto &yieldOp = forOp.getBody()->back();
+      builder.setInsertionPoint(&yieldOp);
+      auto barId = builder.create<arith::ConstantIntOp>(loc, 3, i32Ty);
+      auto numThreads =
+          builder.create<arith::ConstantIntOp>(loc, 256, i32Ty);
+      builder.create<NVVM::BarrierOp>(loc, barId, numThreads);
+    });
+  }
+
+  /// SALA: dump interference graph diagnostics (before and after)
+  void salaDumpIGraphDiagnostic(
+      const SmallVector<BufferT *> &buffers, const GraphT &interference,
+      size_t origSize,
+      const DenseMap<BufferT *, size_t> &baselineOffsets) {
+    auto bufLabel = [](BufferT *buf) -> std::string {
+      std::string label;
+      if (buf->owner->hasAttr("aref_buffer"))
+        label = "aref_buffer";
+      else if (buf->owner->hasAttr("aref_empty_mbarriers"))
+        label = "empty_mbar";
+      else if (buf->owner->hasAttr("aref_full_mbarriers"))
+        label = "full_mbar";
+      else if (buf->owner->getParentOfType<nvidia_gpu::WarpGroupOp>())
+        label = "output(WG)";
+      else
+        label = "other";
+      return label;
+    };
+
+    llvm::errs() << "\n=== SALA Interference Graph Diagnostic ===\n";
+    llvm::errs() << "\nBuffers:\n";
+    for (auto *buf : buffers) {
+      llvm::errs() << "  buf " << buf->id << ": " << buf->size << " bytes, "
+                   << bufLabel(buf) << "\n";
+    }
+
+    llvm::errs() << "\nOffsets (conventional allocator):\n";
+    for (auto *buf : buffers) {
+      auto it = baselineOffsets.find(buf);
+      size_t off = (it != baselineOffsets.end()) ? it->second : buf->offset;
+      llvm::errs() << "  buf " << buf->id << " (" << bufLabel(buf)
+                   << "): offset=" << off << "\n";
+    }
+
+    llvm::errs() << "\nOffsets (SALA, after compaction):\n";
+    for (auto *buf : buffers) {
+      llvm::errs() << "  buf " << buf->id << " (" << bufLabel(buf)
+                   << "): offset=" << buf->offset << "\n";
+    }
+
+    llvm::errs() << "\nSMEM: " << origSize << " -> "
+                 << allocation->sharedMemorySize << " bytes ("
+                 << origSize / 1024 << " KB -> "
+                 << allocation->sharedMemorySize / 1024 << " KB, -"
+                 << (100 - 100 * allocation->sharedMemorySize / origSize)
+                 << "%)\n";
+    llvm::errs() << "===========================================\n\n";
   }
 
 private:
